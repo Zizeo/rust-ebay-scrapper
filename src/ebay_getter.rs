@@ -51,7 +51,7 @@ fn detect_extension(link: &str) -> &str {
 /// Uses headless_chrome to navigate to the URL, gets the page source,
 /// then parses with `scraper`. Retries up to 3 times if the description iframe is missing.
 pub fn get_ebay_data(browser: &Browser, url: &str) -> Option<EbayItem> {
-    let max_retries = 3;
+    let max_retries = 5;
 
     for attempt in 0..max_retries {
         match _try_get_ebay_data(browser, url) {
@@ -403,26 +403,99 @@ pub fn write_item_data(item: &EbayItem, item_id: &str) -> bool {
     let client = Client::new();
     for (i, link) in item.image_link.iter().enumerate() {
         let idx = i + 1;
-        match client.get(link).send() {
+        let mut target_link = link.clone();
+        if target_link.starts_with("//") {
+            target_link = format!("https:{}", target_link);
+        }
+
+        match client.get(&target_link).send() {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    let ext = detect_extension(link);
+                    let ext = detect_extension(&target_link);
                     let filepath = format!("{}/{}{}", folder_path, idx, ext);
                     match resp.bytes() {
                         Ok(bytes) => {
                             if let Err(e) = fs::write(&filepath, &bytes) {
-                                println!("Error writing image: {}", e);
+                                println!("  \u{2717} Error writing image {}: {}", idx, e);
                             }
                         }
-                        Err(e) => println!("Error reading image bytes: {}", e),
+                        Err(e) => {
+                            println!("  \u{2717} Error reading bytes for image {}: {}", idx, e)
+                        }
                     }
                 } else {
-                    println!("Image download failed with status: {}", resp.status());
+                    println!(
+                        "  \u{2717} Image {} download failed (status: {})",
+                        idx,
+                        resp.status()
+                    );
                 }
             }
-            Err(img_error) => {
-                println!("Error downloading image {}: {}", idx, img_error);
+            Err(e) => println!("  \u{2717} Error requesting image {}: {}", idx, e),
+        }
+    }
+
+    true
+}
+
+/// Equivalent of `write_item_data(item, item_id)` but with a custom base path.
+pub fn write_item_data_to_path(item: &EbayItem, item_id: &str, base_path: &str) -> bool {
+    let folder_path = format!("{}/{}", base_path, item_id);
+
+    if let Err(e) = fs::create_dir_all(&folder_path) {
+        println!("Error creating directory: {}", e);
+        return false;
+    }
+
+    // Save JSON data
+    let json_path = format!("{}/data.json", folder_path);
+    match fs::File::create(&json_path) {
+        Ok(mut f) => {
+            let json_str = serde_json::to_string_pretty(item).unwrap_or_else(|_| "{}".to_string());
+            if let Err(e) = f.write_all(json_str.as_bytes()) {
+                println!("Error writing JSON: {}", e);
+                return false;
             }
+        }
+        Err(e) => {
+            println!("Error creating JSON file: {}", e);
+            return false;
+        }
+    }
+
+    // Download images
+    let client = Client::new();
+    for (i, link) in item.image_link.iter().enumerate() {
+        let idx = i + 1;
+        let mut target_link = link.clone();
+        if target_link.starts_with("//") {
+            target_link = format!("https:{}", target_link);
+        }
+
+        match client.get(&target_link).send() {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    let ext = detect_extension(&target_link);
+                    let filepath = format!("{}/{}{}", folder_path, idx, ext);
+                    match resp.bytes() {
+                        Ok(bytes) => {
+                            if let Err(e) = fs::write(&filepath, &bytes) {
+                                println!("  \u{2717} Error writing image {}: {}", idx, e);
+                            }
+                        }
+                        Err(e) => {
+                            println!("  \u{2717} Error reading bytes for image {}: {}", idx, e)
+                        }
+                    }
+                } else {
+                    println!(
+                        "  \u{2717} Image {} download failed (status: {})",
+                        idx,
+                        resp.status()
+                    );
+                }
+            }
+            Err(e) => println!("  \u{2717} Error requesting image {}: {}", idx, e),
         }
     }
 

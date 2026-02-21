@@ -1,24 +1,319 @@
 mod ebay_getter;
 
 use ebay_getter as eg;
-use headless_chrome::Browser;
-use headless_chrome::LaunchOptions;
+use eframe::egui;
+use headless_chrome::{Browser, LaunchOptions};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
-// --- Configuration ---
-const ITEM_FILE: &str = "all_item.txt";
-const DOWNLOAD_DIR: &str = "./download";
+// --- Configuration Defaults ---
 const EBAY_URL_TEMPLATE: &str = "https://www.ebay.fr/itm/";
 
+struct ScraperApp {
+    item_file: Option<PathBuf>,
+    download_dir: Option<PathBuf>,
+    is_running: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+    total_items: Arc<AtomicU32>,
+    success_count: Arc<AtomicU32>,
+    fail_count: Arc<AtomicU32>,
+    status_msg: String,
+    num_threads: usize,
+    max_threads: usize,
+    show_logs: bool,
+    logs: Arc<Mutex<Vec<String>>>,
+}
+
+impl ScraperApp {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let max_threads = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        Self {
+            item_file: None,
+            download_dir: None,
+            is_running: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(AtomicU32::new(0)),
+            total_items: Arc::new(AtomicU32::new(0)),
+            success_count: Arc::new(AtomicU32::new(0)),
+            fail_count: Arc::new(AtomicU32::new(0)),
+            status_msg: "Ready".to_string(),
+            num_threads: (max_threads / 2).max(1),
+            max_threads,
+            show_logs: false,
+            logs: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn add_log(logs: &Arc<Mutex<Vec<String>>>, msg: String) {
+        if let Ok(mut logs) = logs.lock() {
+            logs.push(msg);
+            if logs.len() > 1000 {
+                logs.remove(0);
+            }
+        }
+    }
+
+    fn start_download(&mut self) {
+        let item_file = match &self.item_file {
+            Some(f) => f.clone(),
+            None => {
+                self.status_msg = "Error: Please select an items file.".to_string();
+                return;
+            }
+        };
+
+        let download_dir = match &self.download_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.status_msg = "Error: Please select a download folder.".to_string();
+                return;
+            }
+        };
+
+        let thread_count = self.num_threads;
+
+        self.is_running.store(true, Ordering::SeqCst);
+        self.progress.store(0, Ordering::SeqCst);
+        self.success_count.store(0, Ordering::SeqCst);
+        self.fail_count.store(0, Ordering::SeqCst);
+        self.status_msg = "Initializing...".to_string();
+
+        if let Ok(mut l) = self.logs.lock() {
+            l.clear();
+        }
+
+        let is_running = self.is_running.clone();
+        let progress = self.progress.clone();
+        let total_items_atomic = self.total_items.clone();
+        let success_count = self.success_count.clone();
+        let fail_count = self.fail_count.clone();
+        let logs_clone = self.logs.clone();
+
+        thread::spawn(move || {
+            Self::add_log(&logs_clone, "Starting Chrome...".to_string());
+            // Setup headless Chrome
+            let launch_options = LaunchOptions {
+                headless: true,
+                ..LaunchOptions::default()
+            };
+
+            let browser = match Browser::new(launch_options) {
+                Ok(b) => b,
+                Err(e) => {
+                    Self::add_log(&logs_clone, format!("Error: Browser launch failed: {}", e));
+                    is_running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            // Load all item IDs
+            let all_ids = load_item_ids(item_file.to_str().unwrap_or(""));
+            let download_dir_str = download_dir.to_str().unwrap_or("./download");
+
+            // Create download directory
+            if let Err(_) = fs::create_dir_all(download_dir_str) {}
+
+            let processed_ids = get_processed_ids(download_dir_str);
+            let pending_ids: Vec<String> = all_ids
+                .into_iter()
+                .filter(|id| !processed_ids.contains(id.as_str()))
+                .collect();
+
+            let total = pending_ids.len();
+            total_items_atomic.store(total as u32, Ordering::SeqCst);
+            Self::add_log(&logs_clone, format!("Items to process: {}", total));
+
+            if total == 0 {
+                is_running.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            // Create a custom thread pool for this session
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(thread_count)
+                .build()
+                .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+            Self::add_log(
+                &logs_clone,
+                format!("Using pool with {} threads", thread_count),
+            );
+
+            // Use the pool to process items in parallel
+            pool.install(|| {
+                pending_ids.par_iter().for_each(|item_id| {
+                    if !is_running.load(Ordering::SeqCst) {
+                        return;
+                    }
+
+                    Self::add_log(&logs_clone, format!("Processing item {}", item_id));
+                    let url = format!("{}{}", EBAY_URL_TEMPLATE, item_id);
+                    let item_data = eg::get_ebay_data(&browser, &url);
+
+                    match item_data {
+                        Some(ref item) => {
+                            let success =
+                                eg::write_item_data_to_path(item, item_id, download_dir_str);
+                            if success {
+                                success_count.fetch_add(1, Ordering::SeqCst);
+                                Self::add_log(&logs_clone, format!("✓ Saved {}", item_id));
+                            } else {
+                                fail_count.fetch_add(1, Ordering::SeqCst);
+                                Self::add_log(
+                                    &logs_clone,
+                                    format!("✗ Write failed for {}", item_id),
+                                );
+                            }
+                        }
+                        None => {
+                            fail_count.fetch_add(1, Ordering::SeqCst);
+                            Self::add_log(&logs_clone, format!("✗ Fetch failed for {}", item_id));
+                        }
+                    }
+                    progress.fetch_add(1, Ordering::SeqCst);
+                });
+            });
+
+            Self::add_log(&logs_clone, "Session finished.".to_string());
+            is_running.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
+impl eframe::App for ScraperApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("eBay Multi-threaded Scraper");
+            ui.add_space(10.0);
+
+            // File Picker
+            ui.horizontal(|ui| {
+                ui.label("Items File (TXT):");
+                if ui.button("Select File").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Text Files", &["txt"])
+                        .pick_file()
+                    {
+                        self.item_file = Some(path);
+                    }
+                }
+            });
+            if let Some(path) = &self.item_file {
+                ui.label(format!("Selected: {}", path.display()));
+            }
+            ui.add_space(5.0);
+
+            // Folder Picker
+            ui.horizontal(|ui| {
+                ui.label("Download Folder:");
+                if ui.button("Select Folder").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        self.download_dir = Some(path);
+                    }
+                }
+            });
+            if let Some(path) = &self.download_dir {
+                ui.label(format!("Selected: {}", path.display()));
+            }
+            ui.add_space(10.0);
+
+            // Thread Slider
+            ui.horizontal(|ui| {
+                ui.label("Concurrent Threads:");
+                ui.add(egui::Slider::new(
+                    &mut self.num_threads,
+                    1..=self.max_threads,
+                ));
+            });
+            ui.add_space(10.0);
+
+            // Logs toggle
+            ui.checkbox(&mut self.show_logs, "Show Integrated Logs");
+            ui.add_space(15.0);
+
+            // Start Button
+            let is_running = self.is_running.load(Ordering::SeqCst);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!is_running, egui::Button::new("Start Download"))
+                    .clicked()
+                {
+                    self.start_download();
+                }
+
+                if ui
+                    .add_enabled(is_running, egui::Button::new("Stop"))
+                    .clicked()
+                {
+                    self.is_running.store(false, Ordering::SeqCst);
+                }
+            });
+
+            ui.add_space(20.0);
+
+            // Progress Bar
+            let total = self.total_items.load(Ordering::SeqCst);
+            let current = self.progress.load(Ordering::SeqCst);
+            let progress_val = if total > 0 {
+                current as f32 / total as f32
+            } else {
+                0.0
+            };
+
+            ui.add(egui::ProgressBar::new(progress_val).text(format!("{}/{}", current, total)));
+
+            ui.add_space(10.0);
+            ui.label(format!(
+                "Success: {} | Failed: {}",
+                self.success_count.load(Ordering::SeqCst),
+                self.fail_count.load(Ordering::SeqCst)
+            ));
+
+            if !is_running && current > 0 && current == total {
+                self.status_msg = "Completed!".to_string();
+            } else if is_running {
+                self.status_msg = "Running...".to_string();
+            }
+
+            ui.add_space(10.0);
+            ui.label(format!("Status: {}", self.status_msg));
+
+            // Log Area
+            if self.show_logs {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Logs");
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if let Ok(logs) = self.logs.lock() {
+                            for log in logs.iter() {
+                                ui.label(log);
+                            }
+                        }
+                    });
+            }
+        });
+
+        // Continuous update loop
+        ctx.request_repaint();
+    }
+}
+
 /// Load item IDs from file, one per line.
-/// Strips whitespace and ignores empty lines.
 fn load_item_ids(filepath: &str) -> Vec<String> {
-    let content = fs::read_to_string(filepath).expect("Failed to read item file");
+    let content = match fs::read_to_string(filepath) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
     content
         .lines()
         .map(|line| line.trim().to_string())
@@ -27,7 +322,6 @@ fn load_item_ids(filepath: &str) -> Vec<String> {
 }
 
 /// Return set of item IDs that already have folders in download directory.
-/// This enables restart-safe behavior - we skip items already processed.
 fn get_processed_ids(download_dir: &str) -> HashSet<String> {
     let path = std::path::Path::new(download_dir);
     if !path.exists() {
@@ -41,99 +335,15 @@ fn get_processed_ids(download_dir: &str) -> HashSet<String> {
     }
 }
 
-/// Build eBay item URL from ID.
-fn build_url(item_id: &str) -> String {
-    format!("{}{}", EBAY_URL_TEMPLATE, item_id)
-}
-
-fn main() {
-    // Setup headless Chrome
-    let launch_options = LaunchOptions {
-        headless: true,
-        ..LaunchOptions::default()
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([450.0, 600.0]),
+        ..Default::default()
     };
 
-    let browser = Browser::new(launch_options).expect("Failed to launch browser");
-
-    // Create download directory if it doesn't exist
-    fs::create_dir_all(DOWNLOAD_DIR).expect("Failed to create download directory");
-
-    // Load all item IDs and find pending (unprocessed) ones
-    let all_ids = load_item_ids(ITEM_FILE);
-    let processed_ids = get_processed_ids(DOWNLOAD_DIR);
-    let pending_ids: Vec<&String> = all_ids
-        .iter()
-        .filter(|id| !processed_ids.contains(id.as_str()))
-        .collect();
-
-    println!("{}", "=".repeat(50));
-    println!("eBay Item Scraper - Restart Safe");
-    println!("{}", "=".repeat(50));
-    println!("Total items in file: {}", all_ids.len());
-    println!("Already processed:   {}", processed_ids.len());
-    println!("Pending to process:  {}", pending_ids.len());
-    println!("{}", "=".repeat(50));
-
-    if pending_ids.is_empty() {
-        println!("All items have been processed. Nothing to do.");
-        return;
-    }
-
-    let start_time = Instant::now();
-    let mut success_count = 0u32;
-    let mut fail_count = 0u32;
-
-    // Setup Ctrl+C handler
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = interrupted.clone();
-    ctrlc::set_handler(move || {
-        interrupted_clone.store(true, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
-
-    let total = pending_ids.len();
-    for (idx, item_id) in pending_ids.iter().enumerate() {
-        // Check for Ctrl+C
-        if interrupted.load(Ordering::SeqCst) {
-            println!("\n\n--- Interrupted by user ---");
-            println!("Progress saved. Run again to resume from item {}.", idx + 1);
-            break;
-        }
-
-        let url = build_url(item_id);
-        println!("\n[{}/{}] Processing item {}...", idx + 1, total, item_id);
-
-        // Fetch item data with retry logic built into get_ebay_data
-        let item_data = eg::get_ebay_data(&browser, &url);
-
-        match item_data {
-            Some(ref item) => {
-                let success = eg::write_item_data(item, item_id);
-                if success {
-                    println!("  \u{2713} Saved to download/{}/", item_id);
-                    success_count += 1;
-                } else {
-                    println!("  \u{2717} Failed to save data");
-                    fail_count += 1;
-                }
-            }
-            None => {
-                println!("  \u{2717} Failed to fetch item data");
-                fail_count += 1;
-            }
-        }
-
-        // Rate limiting to avoid being blocked
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    // Session summary
-    let elapsed = start_time.elapsed().as_secs_f64();
-    println!("\n{}", "=".repeat(50));
-    println!("Session Summary");
-    println!("{}", "=".repeat(50));
-    println!("Time elapsed: {:.2} seconds", elapsed);
-    println!("Successful:   {}", success_count);
-    println!("Failed:       {}", fail_count);
-    println!("{}", "=".repeat(50));
+    eframe::run_native(
+        "eBay Scraper",
+        options,
+        Box::new(|cc| Ok(Box::new(ScraperApp::new(cc)))),
+    )
 }
