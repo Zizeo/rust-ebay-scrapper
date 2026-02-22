@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use headless_chrome::Browser;
+use rand::Rng;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ pub struct EbayItem {
     pub price: String,
 }
 
-/// Remove ASCII punctuation from a string (mirrors Python's `str.translate(table)` with `string.punctuation`).
+/// Remove ASCII punctuation from a string
 fn remove_punctuation(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_ascii_punctuation())
@@ -49,6 +50,10 @@ pub fn get_ebay_data(client: &Client, browser: &Browser, url: &str) -> Result<Eb
     let max_retries = 3;
 
     for attempt in 0..max_retries {
+        // Add random jitter between 500ms and 1500ms to mimic human-like timing
+        let jitter = rand::thread_rng().gen_range(500..1500);
+        thread::sleep(Duration::from_millis(jitter));
+
         match _try_get_ebay_data(client, browser, url) {
             Ok(item) => return Ok(item),
             Err(RetryOrFail::Retry(msg)) => {
@@ -85,6 +90,12 @@ fn _try_get_ebay_data(
         .new_tab()
         .map_err(|e| RetryOrFail::Fail(format!("Failed to create tab: {}", e)))?;
 
+    // Enable stealth: Disable webdriver flag
+    let _ = tab.evaluate(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})",
+        false,
+    );
+
     tab.navigate_to(url)
         .map_err(|e| RetryOrFail::Fail(format!("Failed to navigate: {}", e)))?;
 
@@ -120,7 +131,7 @@ fn _try_get_ebay_data(
         .attr("src")
         .ok_or_else(|| RetryOrFail::Fail("Iframe has no src".to_string()))?;
 
-    // Description from iframe src
+    // Description from iframe src (fetched via reqwest for speed)
     let description = {
         client
             .get(url_dsc)
@@ -129,7 +140,36 @@ fn _try_get_ebay_data(
             .and_then(|r| r.text().ok())
             .map(|text| {
                 let soup_dsc = Html::parse_document(&text);
-                let raw_text: String = soup_dsc.root_element().text().collect();
+
+                let mut raw_text = String::new();
+                let mut forbidden_depth = 0;
+
+                // Traverse the tree to collect text while skipping <script> and <style> content
+                for edge in soup_dsc.tree.root().traverse() {
+                    match edge {
+                        ego_tree::iter::Edge::Open(node) => {
+                            if let Some(el) = node.value().as_element() {
+                                if &*el.name.local == "script" || &*el.name.local == "style" {
+                                    forbidden_depth += 1;
+                                }
+                            } else if let Some(t) = node.value().as_text() {
+                                if forbidden_depth == 0 {
+                                    raw_text.push_str(t);
+                                    raw_text.push(' ');
+                                }
+                            }
+                        }
+                        ego_tree::iter::Edge::Close(node) => {
+                            if let Some(el) = node.value().as_element() {
+                                if &*el.name.local == "script" || &*el.name.local == "style" {
+                                    forbidden_depth -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Split by whitespace, skip the first word, and join back
                 raw_text
                     .split_whitespace()
                     .skip(1)
@@ -141,6 +181,7 @@ fn _try_get_ebay_data(
 
     let image_link = {
         let container_sel = Selector::parse("div.ux-image-carousel-container img").unwrap();
+        let mut unique_links = std::collections::HashSet::new();
         soup.select(&container_sel)
             .filter_map(|img| {
                 let el = img.value();
@@ -149,6 +190,7 @@ fn _try_get_ebay_data(
                     .or_else(|| el.attr("src"))
                     .map(|s| s.to_string())
             })
+            .filter(|link| unique_links.insert(link.clone()))
             .collect()
     };
 

@@ -37,8 +37,6 @@ impl BrowserManager {
 
     fn restart(&self) -> Result<(), String> {
         let mut lock = self.browser.write().unwrap();
-        // Check if it was already restarted by another thread
-        // We can't easily check for liveness, but we can try to create a tab as a probe
         if lock.new_tab().is_ok() {
             return Ok(());
         }
@@ -80,8 +78,8 @@ impl ScraperApp {
             success_count: Arc::new(AtomicU32::new(0)),
             fail_count: Arc::new(AtomicU32::new(0)),
             status_msg: "Ready".to_string(),
-            num_threads: (max_threads / 2).max(1),
-            max_threads,
+            num_threads: (max_threads / 2).max(1).min(4), // Default to low concurrency for browser safety
+            max_threads: (max_threads).max(4),
             show_logs: false,
             logs: Arc::new(Mutex::new(Vec::new())),
         }
@@ -135,9 +133,9 @@ impl ScraperApp {
         thread::spawn(move || {
             Self::add_log(&logs_clone, "Starting Chrome...".to_string());
 
-            // Shared reqwest client for connection pooling
             let client = Arc::new(
                 Client::builder()
+                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
                     .pool_idle_timeout(Duration::from_secs(90))
                     .build()
                     .unwrap_or_else(|_| Client::new()),
@@ -148,11 +146,13 @@ impl ScraperApp {
                 headless: true,
                 idle_browser_timeout: Duration::from_secs(120),
                 args: vec![
-                    std::ffi::OsStr::new("--blink-settings=imagesEnabled=false"),
+                    std::ffi::OsStr::new("--blink-settings=imagesEnabled=false"), // Browser-level image blocking
                     std::ffi::OsStr::new("--disable-extensions"),
                     std::ffi::OsStr::new("--disable-gpu"),
                     std::ffi::OsStr::new("--disable-dev-shm-usage"),
                     std::ffi::OsStr::new("--no-sandbox"),
+                    std::ffi::OsStr::new("--disable-blink-features=AutomationControlled"), // Stealth
+                    std::ffi::OsStr::new("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"),
                 ],
                 ..LaunchOptions::default()
             };
@@ -166,11 +166,12 @@ impl ScraperApp {
                 }
             };
 
-            // Load all item IDs
-            let all_ids = load_item_ids(item_file.to_str().unwrap_or(""));
+            let mut all_ids = load_item_ids(item_file.to_str().unwrap_or(""));
+            let mut seen_ids = HashSet::new();
+            all_ids.retain(|id| seen_ids.insert(id.clone()));
+
             let download_dir_str = download_dir.to_str().unwrap_or("./download");
 
-            // Create download directory
             if let Err(_) = fs::create_dir_all(download_dir_str) {}
 
             let processed_ids = get_processed_ids(download_dir_str);
@@ -188,7 +189,6 @@ impl ScraperApp {
                 return;
             }
 
-            // Create a custom thread pool for this session
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(thread_count)
                 .build()
@@ -196,7 +196,7 @@ impl ScraperApp {
 
             Self::add_log(
                 &logs_clone,
-                format!("Using pool with {} threads", thread_count),
+                format!("Using pool with {} browser threads", thread_count),
             );
 
             pool.install(|| {
@@ -275,7 +275,7 @@ impl ScraperApp {
 impl eframe::App for ScraperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("eBay Multi-threaded Scraper");
+            ui.heading("eBay Scraper (Optimized Browser)");
             ui.add_space(10.0);
 
             // File Picker
@@ -327,7 +327,7 @@ impl eframe::App for ScraperApp {
 
             // Thread Slider
             ui.horizontal(|ui| {
-                ui.label("Concurrent Threads:");
+                ui.label("Concurrent Tabs:");
                 ui.add(egui::Slider::new(
                     &mut self.num_threads,
                     1..=self.max_threads,
