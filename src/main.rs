@@ -4,15 +4,51 @@ use ebay_getter as eg;
 use eframe::egui;
 use headless_chrome::{Browser, LaunchOptions};
 use rayon::prelude::*;
+use reqwest::blocking::Client;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 // --- Configuration Defaults ---
 const EBAY_URL_TEMPLATE: &str = "https://www.ebay.fr/itm/";
+
+struct BrowserManager {
+    browser: Arc<RwLock<Arc<Browser>>>,
+    launch_options: LaunchOptions<'static>,
+}
+
+impl BrowserManager {
+    fn new(options: LaunchOptions<'static>) -> Result<Self, String> {
+        let browser = Browser::new(options.clone())
+            .map_err(|e| format!("Failed to launch browser: {}", e))?;
+        Ok(Self {
+            browser: Arc::new(RwLock::new(Arc::new(browser))),
+            launch_options: options,
+        })
+    }
+
+    fn get_browser(&self) -> Arc<Browser> {
+        self.browser.read().unwrap().clone()
+    }
+
+    fn restart(&self) -> Result<(), String> {
+        let mut lock = self.browser.write().unwrap();
+        // Check if it was already restarted by another thread
+        // We can't easily check for liveness, but we can try to create a tab as a probe
+        if lock.new_tab().is_ok() {
+            return Ok(());
+        }
+
+        let new_browser = Browser::new(self.launch_options.clone())
+            .map_err(|e| format!("Failed to restart browser: {}", e))?;
+        *lock = Arc::new(new_browser);
+        Ok(())
+    }
+}
 
 struct ScraperApp {
     item_file: Option<PathBuf>,
@@ -98,16 +134,33 @@ impl ScraperApp {
 
         thread::spawn(move || {
             Self::add_log(&logs_clone, "Starting Chrome...".to_string());
-            // Setup headless Chrome
+
+            // Shared reqwest client for connection pooling
+            let client = Arc::new(
+                Client::builder()
+                    .pool_idle_timeout(Duration::from_secs(90))
+                    .build()
+                    .unwrap_or_else(|_| Client::new()),
+            );
+
+            // Setup headless Chrome with resource blocking and increased timeouts
             let launch_options = LaunchOptions {
                 headless: true,
+                idle_browser_timeout: Duration::from_secs(120),
+                args: vec![
+                    std::ffi::OsStr::new("--blink-settings=imagesEnabled=false"),
+                    std::ffi::OsStr::new("--disable-extensions"),
+                    std::ffi::OsStr::new("--disable-gpu"),
+                    std::ffi::OsStr::new("--disable-dev-shm-usage"),
+                    std::ffi::OsStr::new("--no-sandbox"),
+                ],
                 ..LaunchOptions::default()
             };
 
-            let browser = match Browser::new(launch_options) {
-                Ok(b) => b,
+            let browser_manager = match BrowserManager::new(launch_options) {
+                Ok(bm) => bm,
                 Err(e) => {
-                    Self::add_log(&logs_clone, format!("Error: Browser launch failed: {}", e));
+                    Self::add_log(&logs_clone, format!("Error: {}", e));
                     is_running.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -146,7 +199,6 @@ impl ScraperApp {
                 format!("Using pool with {} threads", thread_count),
             );
 
-            // Use the pool to process items in parallel
             pool.install(|| {
                 pending_ids.par_iter().for_each(|item_id| {
                     if !is_running.load(Ordering::SeqCst) {
@@ -155,26 +207,59 @@ impl ScraperApp {
 
                     Self::add_log(&logs_clone, format!("Processing item {}", item_id));
                     let url = format!("{}{}", EBAY_URL_TEMPLATE, item_id);
-                    let item_data = eg::get_ebay_data(&browser, &url);
 
-                    match item_data {
-                        Some(ref item) => {
-                            let success =
-                                eg::write_item_data_to_path(item, item_id, download_dir_str);
-                            if success {
-                                success_count.fetch_add(1, Ordering::SeqCst);
-                                Self::add_log(&logs_clone, format!("✓ Saved {}", item_id));
-                            } else {
-                                fail_count.fetch_add(1, Ordering::SeqCst);
-                                Self::add_log(
-                                    &logs_clone,
-                                    format!("✗ Write failed for {}", item_id),
+                    let mut attempt = 0;
+                    let max_retry_browser = 3;
+
+                    while attempt < max_retry_browser {
+                        let browser = browser_manager.get_browser();
+                        match eg::get_ebay_data(&client, &browser, &url) {
+                            Ok(item) => {
+                                let success = eg::write_item_data_to_path(
+                                    &client,
+                                    &item,
+                                    item_id,
+                                    download_dir_str,
                                 );
+                                if success {
+                                    success_count.fetch_add(1, Ordering::SeqCst);
+                                    Self::add_log(&logs_clone, format!("✓ Saved {}", item_id));
+                                } else {
+                                    fail_count.fetch_add(1, Ordering::SeqCst);
+                                    Self::add_log(
+                                        &logs_clone,
+                                        format!("✗ Write failed for {}", item_id),
+                                    );
+                                }
+                                break;
                             }
-                        }
-                        None => {
-                            fail_count.fetch_add(1, Ordering::SeqCst);
-                            Self::add_log(&logs_clone, format!("✗ Fetch failed for {}", item_id));
+                            Err(e) => {
+                                if e.contains("connection is closed")
+                                    || e.contains("underlying connection is closed")
+                                {
+                                    Self::add_log(
+                                        &logs_clone,
+                                        format!("! Browser dead for {}, restarting...", item_id),
+                                    );
+                                    if let Err(restart_err) = browser_manager.restart() {
+                                        Self::add_log(
+                                            &logs_clone,
+                                            format!("!! Restart failed: {}", restart_err),
+                                        );
+                                        fail_count.fetch_add(1, Ordering::SeqCst);
+                                        break;
+                                    }
+                                    attempt += 1;
+                                    continue;
+                                } else {
+                                    fail_count.fetch_add(1, Ordering::SeqCst);
+                                    Self::add_log(
+                                        &logs_clone,
+                                        format!("✗ Fetch failed for {}: {}", item_id, e),
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                     progress.fetch_add(1, Ordering::SeqCst);
@@ -206,7 +291,15 @@ impl eframe::App for ScraperApp {
                 }
             });
             if let Some(path) = &self.item_file {
-                ui.label(format!("Selected: {}", path.display()));
+                let display_text = if path.to_string_lossy().len() > 50 {
+                    format!(
+                        "...{}",
+                        &path.to_string_lossy()[path.to_string_lossy().len() - 47..]
+                    )
+                } else {
+                    path.to_string_lossy().to_string()
+                };
+                ui.label(format!("Selected: {}", display_text));
             }
             ui.add_space(5.0);
 
@@ -220,7 +313,15 @@ impl eframe::App for ScraperApp {
                 }
             });
             if let Some(path) = &self.download_dir {
-                ui.label(format!("Selected: {}", path.display()));
+                let display_text = if path.to_string_lossy().len() > 50 {
+                    format!(
+                        "...{}",
+                        &path.to_string_lossy()[path.to_string_lossy().len() - 47..]
+                    )
+                } else {
+                    path.to_string_lossy().to_string()
+                };
+                ui.label(format!("Selected: {}", display_text));
             }
             ui.add_space(10.0);
 
