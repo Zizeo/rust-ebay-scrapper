@@ -35,6 +35,7 @@ The GUI and multithreading logic was generated with the help of AI.
 - Chrome or Chromium browser installed.
 
 ### Installation
+Download the release or :
 
 1. Clone the repository:
    ```bash
