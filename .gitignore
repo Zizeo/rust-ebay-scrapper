@@ -12,6 +12,8 @@ download/
 OPTIMIZATIONS.md
 GEMINI.md
 BROWSER_OPTIMIZATIONS.md
+Cargo.lock
+all_items.txt
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
