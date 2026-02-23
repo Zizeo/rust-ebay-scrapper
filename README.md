@@ -1,4 +1,3 @@
-```markdown
 # Rust eBay Listing Saver
 
 A high-performance, multithreaded eBay listing scraper built with Rust, featuring a user-friendly GUI and optimized browser automation.
