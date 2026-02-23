@@ -11,6 +11,7 @@ download/
 *.pdb
 OPTIMIZATIONS.md
 GEMINI.md
+BROWSER_OPTIMIZATIONS.md
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
