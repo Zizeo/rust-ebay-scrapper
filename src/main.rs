@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 mod ebay_getter;
 
 use ebay_getter as eg;
@@ -213,13 +214,14 @@ impl ScraperApp {
 
                     while attempt < max_retry_browser {
                         let browser = browser_manager.get_browser();
-                        match eg::get_ebay_data(&client, &browser, &url) {
+                        match eg::get_ebay_data(&client, &browser, &url, &logs_clone) {
                             Ok(item) => {
                                 let success = eg::write_item_data_to_path(
                                     &client,
                                     &item,
                                     item_id,
                                     download_dir_str,
+                                    &logs_clone,
                                 );
                                 if success {
                                     success_count.fetch_add(1, Ordering::SeqCst);
@@ -275,7 +277,7 @@ impl ScraperApp {
 impl eframe::App for ScraperApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("eBay Scraper (Optimized Browser)");
+            ui.heading("eBay Listing Saver");
             ui.add_space(10.0);
 
             // File Picker
@@ -418,7 +420,13 @@ fn load_item_ids(filepath: &str) -> Vec<String> {
     content
         .lines()
         .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            // eBay IDs are strictly numeric. This prevents path traversal like '../'
+            line.chars().all(|c| c.is_ascii_digit())
+        })
         .collect()
 }
 

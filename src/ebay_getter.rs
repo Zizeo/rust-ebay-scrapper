@@ -7,6 +7,7 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -45,8 +46,23 @@ fn detect_extension(link: &str) -> &str {
     }
 }
 
+/// Helper to add logs to the GUI buffer
+fn add_log(logs: &Arc<Mutex<Vec<String>>>, msg: String) {
+    if let Ok(mut logs) = logs.lock() {
+        logs.push(msg);
+        if logs.len() > 1000 {
+            logs.remove(0);
+        }
+    }
+}
+
 /// Equivalent of `get_ebay_data(driver, url)` in Python.
-pub fn get_ebay_data(client: &Client, browser: &Browser, url: &str) -> Result<EbayItem, String> {
+pub fn get_ebay_data(
+    client: &Client,
+    browser: &Browser,
+    url: &str,
+    logs: &Arc<Mutex<Vec<String>>>,
+) -> Result<EbayItem, String> {
     let max_retries = 3;
 
     for attempt in 0..max_retries {
@@ -60,7 +76,10 @@ pub fn get_ebay_data(client: &Client, browser: &Browser, url: &str) -> Result<Eb
                 if msg.contains("connection is closed") {
                     return Err(msg);
                 }
-                println!("Retry {}/{}: {}", attempt + 1, max_retries, msg);
+                add_log(
+                    logs,
+                    format!("Retry {}/{}: {}", attempt + 1, max_retries, msg),
+                );
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -68,7 +87,10 @@ pub fn get_ebay_data(client: &Client, browser: &Browser, url: &str) -> Result<Eb
                 if msg.contains("connection is closed") {
                     return Err(msg);
                 }
-                println!("Error: {} | Attempt {}/{}", msg, attempt + 1, max_retries);
+                add_log(
+                    logs,
+                    format!("Error: {} | Attempt {}/{}", msg, attempt + 1, max_retries),
+                );
                 return Err(msg);
             }
         }
@@ -237,9 +259,14 @@ fn sanitize_image_url(link: &str) -> Option<String> {
 }
 
 /// Internal helper for writing item data and downloading images in parallel.
-fn _write_item_data_internal(client: &Client, item: &EbayItem, folder_path: &str) -> bool {
+fn _write_item_data_internal(
+    client: &Client,
+    item: &EbayItem,
+    folder_path: &str,
+    logs: &Arc<Mutex<Vec<String>>>,
+) -> bool {
     if let Err(e) = fs::create_dir_all(folder_path) {
-        println!("Error creating dir {}: {}", folder_path, e);
+        add_log(logs, format!("Error creating dir {}: {}", folder_path, e));
         return false;
     }
 
@@ -276,7 +303,8 @@ pub fn write_item_data_to_path(
     item: &EbayItem,
     item_id: &str,
     base_path: &str,
+    logs: &Arc<Mutex<Vec<String>>>,
 ) -> bool {
     let folder_path = format!("{}/{}", base_path, item_id);
-    _write_item_data_internal(client, item, &folder_path)
+    _write_item_data_internal(client, item, &folder_path, logs)
 }
