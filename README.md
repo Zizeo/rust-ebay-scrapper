@@ -1,4 +1,4 @@
-# Rust eBay Listing Saver
+# Rust eBay Scrapper / Listing Saver
 
 A high-performance, multithreaded eBay listing scraper built with Rust, featuring a user-friendly GUI and optimized browser automation.
 This project is aimed at ebay store owners who want to save all of their listings. The best way is to generate a store report, where all listings Ids are listed.
